@@ -15,4 +15,4 @@ COPY app.py .
 ENV PORT=8080 PYTHONUNBUFFERED=1
 EXPOSE 8080
 # refresh yt-dlp on every start (YouTube changes weekly), then serve
-CMD sh -c "pip install -q -U yt-dlp || true; yt-dlp --version; gunicorn -w 1 --threads 8 --timeout 900 -b 0.0.0.0:${PORT} app:app"
+CMD sh -c "pip install -q -U 'yt-dlp[default]' || true; yt-dlp --version; gunicorn -w 1 --threads 8 --timeout 900 -b 0.0.0.0:${PORT} app:app"
