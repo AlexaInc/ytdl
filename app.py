@@ -8,6 +8,8 @@ Optionally streams the file back too.
   GET  /health
   POST /get-info   {url}                                  -> metadata
   POST /convert    {url, type:"audio"|"video"}            -> {url, filename, video_id, size, cached}
+                   (202 {status:"processing"} if not done within SYNC_WAIT_SEC â€” call again)
+  GET  /logs, /jobs  diagnostics (protected by RELAY_SECRET)
   POST /download   {url, type}                            -> streams the file
   GET  /file/<video_id>.<mp3|mp4>                         -> redirect to bucket (or stream if private)
 
@@ -30,6 +32,13 @@ import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("ytdl")
+from collections import deque
+_ring = deque(maxlen=400)
+class _Ring(logging.Handler):
+    def emit(self, r):
+        try: _ring.append(self.format(r))
+        except Exception: pass
+_rh = _Ring(); _rh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s")); logging.getLogger().addHandler(_rh)
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 # player clients tried in order per cookie file ("" = yt-dlp default chain)
@@ -118,9 +127,12 @@ BOT_RE = re.compile(r"sign in to confirm|not a bot|login_required|HTTP Error 429
 def ytdlp_base(cookie_path, client=None):
     a = ["yt-dlp", "--no-warnings", "--no-playlist", "--no-progress", "--no-cache-dir",
          "--retries", "3", "--fragment-retries", "3", "--socket-timeout", "20",
-         "--js-runtimes", "deno", "--ffmpeg-location", shutil.which("ffmpeg") or "ffmpeg"]
+         "--js-runtimes", "deno", "--ffmpeg-location", shutil.which("ffmpeg") or "ffmpeg",
+         "--concurrent-fragments", "1", "--postprocessor-args", "ffmpeg:-threads 1"]
     if cookie_path: a += ["--cookies", str(cookie_path)]
-    if client and client != "default": a += ["--extractor-args", f"youtube:player_client={client}"]
+    ea = "youtube:formats=missing_pot"
+    if client and client != "default": ea += f";player_client={client}"
+    a += ["--extractor-args", ea]
     return a
 
 def run(args, timeout):
@@ -148,12 +160,14 @@ def download(vid, is_video):
     ext = "mp4" if is_video else "mp3"
     tmpdir = Path(tempfile.mkdtemp(prefix=f"{vid}_", dir=WORK))
     out = str(tmpdir / f"{vid}.%(ext)s")
-    fmt = ([ "-f", f"bv[height<={MAX_HEIGHT}][ext=mp4]+ba[ext=m4a]/b[height<={MAX_HEIGHT}][ext=mp4]/bv[height<={MAX_HEIGHT}]+ba/b", "--merge-output-format", "mp4"]
-           if is_video else ["-f", "ba[ext=m4a]/ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "128K"])
-    tries = max(1, len(cookies.all_paths())) + 1  # each cookie file once, then one without
+    # keep it simple: take whatever is available, ffmpeg converts afterwards
+    fmt = (["-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]/bv*+ba/b", "--merge-output-format", "mp4",
+            "--recode-video", "mp4"]
+           if is_video else ["-f", "ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "128K"])
+    tries = len(cookies.all_paths()) or 1          # each cookie file once (no-cookie pass only if none configured)
     last = ""
     for n in range(tries):
-        c = cookies.pick() if n < tries - 1 else None
+        c = cookies.pick()
         hard = False
         for client in YT_CLIENTS:
             args = ytdlp_base(c, client) + ["--print", "after_move:title", "-o", out] + fmt + [f"https://youtu.be/{vid}"]
@@ -246,6 +260,38 @@ def ensure(vid, is_video):
         with inflight_lock: inflight.pop(key, None)
         ev.set()
 
+# ----------------------------------------------------------------- async jobs (Back4App proxy kills requests >30 s)
+jobs = {}                      # key -> {"ev": Event, "result": dict|None, "error": str|None, "started": float}
+jobs_lock = threading.Lock()
+SYNC_WAIT = float(os.getenv("SYNC_WAIT_SEC", "20"))
+
+def _job_run(key, vid, is_video):
+    j = jobs[key]
+    try:
+        j["result"] = ensure(vid, is_video)
+        log.info("job %s done: %s", key, j["result"].get("size"))
+    except Exception as e:
+        j["error"] = str(e); log.error("job %s failed: %s", key, e)
+    finally:
+        j["ev"].set()
+
+def submit(vid, is_video, wait=SYNC_WAIT):
+    """Start (or join) the job for this video; wait up to `wait` s. Returns (result, error, pending)."""
+    ext = "mp4" if is_video else "mp3"; key = f"{vid}:{ext}"
+    with jobs_lock:
+        j = jobs.get(key)
+        if j is None:
+            j = jobs[key] = {"ev": threading.Event(), "result": None, "error": None, "started": time.time()}
+            threading.Thread(target=_job_run, args=(key, vid, is_video), daemon=True).start()
+    j["ev"].wait(wait)
+    if not j["ev"].is_set(): return None, None, True
+    r, e = j["result"], j["error"]
+    # finished: forget the job (error -> next call retries; success in bucket -> bucket cache serves it)
+    if e or (r and not r.get("local")):
+        with jobs_lock:
+            if jobs.get(key) is j: jobs.pop(key, None)
+    return r, e, False
+
 def cleanup_local(result):
     p = result.get("local")
     if p and result.get("bucket_path"):
@@ -294,10 +340,11 @@ def convert():
     vid = video_id(b.get("url"))
     if not vid: return jsonify(error="Invalid YouTube URL"), 400
     is_video = b.get("type") == "video"; ext = "mp4" if is_video else "mp3"
-    try:
-        r = ensure(vid, is_video)
-    except Exception as e:
-        return jsonify(error=str(e)), 502
+    r, err, pending = submit(vid, is_video, wait=float(b.get("wait", SYNC_WAIT)))
+    if pending:
+        return jsonify(status="processing", video_id=vid, type=ext, retry_after=5,
+                       message="still downloading â€” POST /convert again with the same body"), 202
+    if err: return jsonify(error=err), 502
     out = {k: r.get(k) for k in ("video_id", "filename", "size", "cached")}
     out["url"] = public_link(vid, ext, r["filename"]) if r.get("bucket_path") else request.host_url.rstrip("/") + f"/file/{vid}.{ext}"
     if r.get("bucket_path"): out["bucket_url"] = bucket_url(r["bucket_path"])
@@ -319,16 +366,26 @@ def download_route():
     if not vid: return jsonify(error="Invalid YouTube URL"), 400
     is_video = b.get("type") == "video"; ext = "mp4" if is_video else "mp3"
     mime = "video/mp4" if is_video else "audio/mpeg"
-    try:
-        r = ensure(vid, is_video)
-    except Exception as e:
-        return jsonify(error=str(e)), 502
+    r, err, pending = submit(vid, is_video, wait=25)
+    if pending:
+        return jsonify(status="processing", video_id=vid, type=ext, retry_after=5), 202
+    if err: return jsonify(error=err), 502
     if r.get("local") and Path(r["local"]).exists():
         resp = send_file(r["local"], mimetype=mime, as_attachment=True, download_name=r["filename"])
         @resp.call_on_close
         def _c(): shutil.rmtree(Path(r["local"]).parent, ignore_errors=True)
         return resp
     return stream_bucket(r["bucket_path"], r["filename"], mime)
+
+@app.get("/logs")
+def logs_route():
+    n = min(int(request.args.get("n", 200)), 400)
+    return Response("\n".join(list(_ring)[-n:]), mimetype="text/plain")
+
+@app.get("/jobs")
+def jobs_route():
+    with jobs_lock:
+        return jsonify({k: {"done": v["ev"].is_set(), "error": v["error"], "age": round(time.time() - v["started"])} for k, v in jobs.items()})
 
 @app.get("/file/<name>")
 def file_route(name):
