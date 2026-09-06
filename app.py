@@ -1,5 +1,5 @@
 """
-ytdl-b4a — yt-dlp download service for Back4App (or any Docker host).
+ytdl-b4a â€” yt-dlp download service for Back4App (or any Docker host).
 
 Downloads YouTube audio/video with yt-dlp (cookies from remote URLs, rotated),
 uploads the result to a Hugging Face Storage Bucket and returns a direct link.
@@ -32,6 +32,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ytdl")
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+# player clients tried in order per cookie file ("" = yt-dlp default chain)
+YT_CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "mweb,web_safari,android,default").split(",") if c.strip()]
+RELOAD_RE = re.compile(r"needs to be reloaded|Requested format is not available|Sign in to confirm|not a bot|LOGIN_REQUIRED|Please sign in", re.I)
 HF_BUCKET = os.getenv("HF_BUCKET", "").strip()
 HF_BUCKET_PUBLIC = os.getenv("HF_BUCKET_PUBLIC", "0") == "1"
 COOKIES_URLS = [u.strip() for u in re.split(r"[,\n]", os.getenv("COOKIES_URLS", "")) if u.strip()]
@@ -117,7 +120,7 @@ def ytdlp_base(cookie_path, client=None):
          "--retries", "3", "--fragment-retries", "3", "--socket-timeout", "20",
          "--js-runtimes", "deno", "--ffmpeg-location", shutil.which("ffmpeg") or "ffmpeg"]
     if cookie_path: a += ["--cookies", str(cookie_path)]
-    if client: a += ["--extractor-args", f"youtube:player_client={client}"]
+    if client and client != "default": a += ["--extractor-args", f"youtube:player_client={client}"]
     return a
 
 def run(args, timeout):
@@ -125,12 +128,14 @@ def run(args, timeout):
     return p.returncode, p.stdout, p.stderr
 
 def probe(vid):
-    """title, duration(sec), channel via yt-dlp (with cookies) — falls back to oEmbed."""
+    """title, duration(sec), channel via yt-dlp (with cookies) â€” falls back to oEmbed."""
     c = cookies.pick()
-    rc, out, err = run(ytdlp_base(c) + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(channel,uploader)s", f"https://youtu.be/{vid}"], 60)
-    if rc == 0 and out.strip():
-        t, d, ch = (out.strip().split("\n")[-1].split("\t") + ["", "", ""])[:3]
-        return t, int(float(d or 0) or 0), ch
+    err = ""
+    for client in YT_CLIENTS[:2]:
+        rc, out, err = run(ytdlp_base(c, client) + ["--skip-download", "--print", "%(title)s\t%(duration)s\t%(channel,uploader)s", f"https://youtu.be/{vid}"], 60)
+        if rc == 0 and out.strip():
+            t, d, ch = (out.strip().split("\n")[-1].split("\t") + ["", "", ""])[:3]
+            return t, int(float(d or 0) or 0), ch
     if BOT_RE.search(err): cookies.bench(c)
     try:
         j = requests.get(f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json", timeout=8).json()
@@ -149,22 +154,27 @@ def download(vid, is_video):
     last = ""
     for n in range(tries):
         c = cookies.pick() if n < tries - 1 else None
-        args = ytdlp_base(c) + ["--print", "after_move:title", "-o", out] + fmt + [f"https://youtu.be/{vid}"]
-        if MAX_DURATION: args += ["--match-filter", f"duration<={MAX_DURATION}"]
-        log.info("yt-dlp %s %s cookies=%s", vid, ext, c.name if c else "none")
-        try:
-            rc, so, se = run(args, 900 if is_video else 400)
-        except subprocess.TimeoutExpired:
-            last = "yt-dlp timeout"; continue
-        files = sorted(tmpdir.glob(f"{vid}.{ext}"))
-        if rc == 0 and files:
-            title = (so.strip().split("\n") or [vid])[-1].strip() or vid
-            return files[0], title
-        last = (se.strip().split("\n") or ["unknown"])[-1]
-        log.warning("yt-dlp failed (%s): %s", c.name if c else "no-cookies", last[:200])
+        hard = False
+        for client in YT_CLIENTS:
+            args = ytdlp_base(c, client) + ["--print", "after_move:title", "-o", out] + fmt + [f"https://youtu.be/{vid}"]
+            if MAX_DURATION: args += ["--match-filter", f"duration<={MAX_DURATION}"]
+            log.info("yt-dlp %s %s cookies=%s client=%s", vid, ext, c.name if c else "none", client)
+            try:
+                rc, so, se = run(args, 900 if is_video else 400)
+            except subprocess.TimeoutExpired:
+                last = "yt-dlp timeout"; continue
+            files = sorted(tmpdir.glob(f"{vid}.{ext}"))
+            if rc == 0 and files:
+                title = (so.strip().split("\n") or [vid])[-1].strip() or vid
+                return files[0], title
+            last = (se.strip().split("\n") or ["unknown"])[-1]
+            log.warning("yt-dlp failed (%s/%s): %s", c.name if c else "no-cookies", client, last[:200])
+            for f in tmpdir.glob("*"): f.unlink(missing_ok=True)
+            if RELOAD_RE.search(last): continue           # try next client
+            if "match-filter" in last or "does not pass filter" in last: hard = True
+            hard = True; break                             # private/geo/etc â€“ no point rotating
+        if hard: break
         if BOT_RE.search(last): cookies.bench(c)
-        elif "match-filter" in last or "does not pass filter" in last: break
-        else: break  # hard error (private video, geo, etc.) – no point rotating
     shutil.rmtree(tmpdir, ignore_errors=True)
     raise RuntimeError(last)
 
@@ -255,7 +265,17 @@ def cors(r):
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, cookies=len(cookies.all_paths()), bucket=HF_BUCKET or None, public=HF_BUCKET_PUBLIC,
+    info = []
+    for f in cookies.all_paths():
+        try:
+            names = {l.split("\t")[5] for l in f.read_text().splitlines() if not l.startswith("#") and l.count("\t") >= 6}
+        except Exception:
+            names = set()
+        info.append({"file": f.name, "cookies": len(names),
+                     "logged_in": all(n in names for n in ("SID", "HSID", "SSID", "APISID", "SAPISID", "LOGIN_INFO")),
+                     "benched": cookies.bad_until.get(f, 0) > time.time()})
+    return jsonify(ok=True, cookies=len(cookies.all_paths()), cookie_files=info, clients=YT_CLIENTS,
+                   bucket=HF_BUCKET or None, public=HF_BUCKET_PUBLIC,
                    ytdlp=subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True).stdout.strip())
 
 @app.post("/get-info")
