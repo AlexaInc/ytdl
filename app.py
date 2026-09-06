@@ -41,8 +41,9 @@ class _Ring(logging.Handler):
 _rh = _Ring(); _rh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s")); logging.getLogger().addHandler(_rh)
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()   # e.g. http://user:pass@host:port or socks5://...
 # player clients tried in order per cookie file ("" = yt-dlp default chain)
-YT_CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "mweb,web_safari,android,default").split(",") if c.strip()]
+YT_CLIENTS = [c.strip() for c in os.getenv("YT_CLIENTS", "default,mweb,android").split(",") if c.strip()]
 RELOAD_RE = re.compile(r"needs to be reloaded|Requested format is not available|Sign in to confirm|not a bot|LOGIN_REQUIRED|Please sign in", re.I)
 HF_BUCKET = os.getenv("HF_BUCKET", "").strip()
 HF_BUCKET_PUBLIC = os.getenv("HF_BUCKET_PUBLIC", "0") == "1"
@@ -126,10 +127,12 @@ BOT_RE = re.compile(r"sign in to confirm|not a bot|login_required|HTTP Error 429
 
 def ytdlp_base(cookie_path, client=None):
     a = ["yt-dlp", "--no-warnings", "--no-playlist", "--no-progress", "--no-cache-dir",
-         "--retries", "3", "--fragment-retries", "3", "--socket-timeout", "20",
+         "--retries", "3", "--fragment-retries", "3", "--extractor-retries", "3", "--socket-timeout", "30",
+         "--geo-bypass", "--no-check-certificates", "--sleep-requests", "1",
          "--js-runtimes", "deno", "--ffmpeg-location", shutil.which("ffmpeg") or "ffmpeg",
          "--concurrent-fragments", "1", "--postprocessor-args", "ffmpeg:-threads 1"]
     if cookie_path: a += ["--cookies", str(cookie_path)]
+    if YTDLP_PROXY: a += ["--proxy", YTDLP_PROXY]
     ea = "youtube:formats=missing_pot"
     if client and client != "default": ea += f";player_client={client}"
     a += ["--extractor-args", ea]
@@ -320,7 +323,11 @@ def health():
         info.append({"file": f.name, "cookies": len(names),
                      "logged_in": all(n in names for n in ("SID", "HSID", "SSID", "APISID", "SAPISID", "LOGIN_INFO")),
                      "benched": cookies.bad_until.get(f, 0) > time.time()})
-    return jsonify(ok=True, cookies=len(cookies.all_paths()), cookie_files=info, clients=YT_CLIENTS,
+    try:
+        import importlib.metadata as _md; ejs = _md.version("yt-dlp-ejs")
+    except Exception: ejs = None
+    return jsonify(ok=True, cookies=len(cookies.all_paths()), cookie_files=info, clients=YT_CLIENTS, proxy=bool(YTDLP_PROXY),
+                   ejs=ejs, deno=bool(shutil.which("deno")),
                    bucket=HF_BUCKET or None, public=HF_BUCKET_PUBLIC,
                    ytdlp=subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True).stdout.strip())
 
@@ -376,6 +383,20 @@ def download_route():
         def _c(): shutil.rmtree(Path(r["local"]).parent, ignore_errors=True)
         return resp
     return stream_bucket(r["bucket_path"], r["filename"], mime)
+
+@app.get("/debug")
+def debug_route():
+    """Verbose yt-dlp diagnostics: /debug?url=...&client=mweb"""
+    vid = video_id(request.args.get("url", "https://youtu.be/9HBCQqpw-nw"))
+    if not vid: abort(400)
+    c = cookies.pick()
+    args = ytdlp_base(c, request.args.get("client") or None) + ["-v", "--list-formats", f"https://youtu.be/{vid}"]
+    try:
+        rc, so, se = run(args, 120)
+    except subprocess.TimeoutExpired:
+        return Response("timeout", mimetype="text/plain")
+    txt = f"$ {' '.join(a for a in args if not str(a).startswith('/'))}\nrc={rc}\n\n--- stderr ---\n{se}\n--- stdout ---\n{so}"
+    return Response(re.sub(r"(SID|LOGIN_INFO|SAPISID)=\S+", r"\1=***", txt), mimetype="text/plain")
 
 @app.get("/logs")
 def logs_route():
