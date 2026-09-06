@@ -1,5 +1,6 @@
 flask>=3.0
 gunicorn>=22
 requests>=2.32
-yt-dlp>=2025.8
+# [default] pulls in yt-dlp-ejs (JS challenge solver) — REQUIRED, without it YouTube returns no formats
+yt-dlp[default]>=2026.8
 huggingface_hub>=1.0
